@@ -1,0 +1,121 @@
+name: Tag & Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tagged: ${{ steps.tag.outputs.tagged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: echo "version=v$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag exists
+        id: tag
+        run: |
+          if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag
+        if: steps.tag.outputs.tagged == 'true'
+        run: |
+          git config user.name "Relentless"
+          git config user.email "noreply@relentlessworks.com"
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+  cross-compile:
+    needs: tag
+    if: needs.tag.outputs.tagged == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cross-compile
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          CGO_ENABLED=0 go build -ldflags "-s -w" -o passkit-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/passkit
+          tar czf passkit-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz passkit-${{ matrix.goos }}-${{ matrix.goarch }} README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: passkit-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: passkit-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+
+  release:
+    needs: [tag, cross-compile]
+    if: needs.tag.outputs.tagged == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.tag.outputs.version }}"
+          # Create release
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"$VERSION\",\"name\":\"passkit $VERSION\",\"body\":\"passkit $VERSION release\",\"draft\":false,\"prerelease\":false}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases"
+          
+          # Get release ID
+          RELEASE_ID=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION" | \
+            jq -r '.id')
+          
+          # Upload assets
+          for f in artifacts/passkit-*/*.tar.gz; do
+            NAME=$(basename "$f")
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Content-Type: application/gzip" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=$NAME"
+          done
+          
+          # Generate and upload checksums
+          cd artifacts
+          find . -name "*.tar.gz" -exec sha256sum {} \; > checksums.txt
+          curl -s -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @checksums.txt \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=checksums.txt"
