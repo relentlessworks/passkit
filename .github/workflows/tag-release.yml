@@ -77,6 +77,8 @@ jobs:
     needs: [tag, cross-compile]
     if: needs.tag.outputs.tagged == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
