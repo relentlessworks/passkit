@@ -1,0 +1,5 @@
+/passkit
+*.exe
+*.dll
+*.so
+*.dylib
